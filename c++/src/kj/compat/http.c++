@@ -5418,7 +5418,16 @@ public:
   }
 
   kj::Promise<ConnectResponse> connect(kj::StringPtr host, const HttpHeaders& headers) override {
-    KJ_UNIMPLEMENTED("connect() is not implemented for NetworkHttpClient");
+    // CC: https://github.com/capnproto/capnproto/pull/1454#discussion_r900414879
+    // We want to connect directly instead of going through a proxy here.
+    auto address = co_await network.parseAddress(host);
+    auto connection = co_await address->connect();
+    co_return ConnectResponse {
+      .statusCode = 200,
+      .statusText = "OK",
+      .headers = &headers,
+      .connectionOrBody = kj::mv(connection),
+    };
   }
 
 private:
