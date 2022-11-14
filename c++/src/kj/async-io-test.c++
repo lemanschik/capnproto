@@ -1156,6 +1156,7 @@ KJ_TEST("NetworkFilter") {
   KJ_EXPECT(!allowed4(base, "240.1.2.3"));
 
   {
+    KJ_DBG("FIRST");
     _::NetworkFilter filter({"public"}, {}, base);
 
     KJ_EXPECT(allowed4(filter, "8.8.8.8"));
@@ -1190,6 +1191,71 @@ KJ_TEST("NetworkFilter") {
   }
 
   {
+    KJ_DBG("ASDASD");
+    _::NetworkFilter filter({"local", "public"}, {}, base);
+
+    // Public
+    KJ_EXPECT(allowed4(filter, "8.8.8.8"));
+
+    // Local
+    KJ_EXPECT(allowed4(filter, "127.0.0.1"));
+    KJ_EXPECT(allowed4(filter, "0.0.0.0"));
+    KJ_EXPECT(allowed4(filter, "localhost"));
+
+    // Private
+    KJ_EXPECT(!allowed6(filter, "fc00::1234"));
+    KJ_EXPECT(!allowed4(filter, "192.168.0.1"));
+  }
+
+  { // https://github.com/cloudflare/workerd/issues/62
+    _::NetworkFilter filter({"public", "private", "local", "network"}, {}, base);
+
+    // Public
+    KJ_EXPECT(allowed4(filter, "8.8.8.8"));
+
+    // Local
+    KJ_EXPECT(allowed4(filter, "127.0.0.1"));
+    KJ_EXPECT(allowed4(filter, "0.0.0.0"));
+    KJ_EXPECT(allowed4(filter, "localhost"));
+
+    // Private
+    KJ_EXPECT(allowed6(filter, "fc00::1234"));
+    KJ_EXPECT(allowed4(filter, "192.168.0.1"));
+  }
+
+  { // https://github.com/cloudflare/workerd/issues/62
+    _::NetworkFilter filter({"public", "127.0.0.1/8"}, {}, base);
+
+    // Public
+    KJ_EXPECT(allowed4(filter, "8.8.8.8"));
+
+    // Local
+    KJ_EXPECT(allowed4(filter, "127.0.0.1"));
+    KJ_EXPECT(!allowed4(filter, "0.0.0.0"));
+    KJ_EXPECT(!allowed4(filter, "localhost"));
+
+    // Private
+    KJ_EXPECT(!allowed6(filter, "fc00::1234"));
+    KJ_EXPECT(!allowed4(filter, "192.168.0.1"));
+  }
+
+  {
+    _::NetworkFilter filter({"local", "public", "private"}, {}, base);
+
+    // Public
+    KJ_EXPECT(allowed4(filter, "8.8.8.8"));
+
+    // Local
+    KJ_EXPECT(allowed4(filter, "127.0.0.1"));
+    KJ_EXPECT(allowed4(filter, "0.0.0.0"));
+    KJ_EXPECT(allowed4(filter, "localhost"));
+
+    // Private
+    KJ_EXPECT(allowed6(filter, "fc00::1234"));
+    KJ_EXPECT(allowed4(filter, "192.168.0.1"));
+  }
+
+  {
     _::NetworkFilter filter({"1.0.0.0/8", "1.2.3.0/24"}, {"1.2.0.0/16", "1.2.3.4/32"}, base);
 
     KJ_EXPECT(!allowed4(filter, "8.8.8.8"));
@@ -1200,6 +1266,13 @@ KJ_TEST("NetworkFilter") {
     KJ_EXPECT(allowed4(filter, "1.2.3.1"));
     KJ_EXPECT(!allowed4(filter, "1.2.3.4"));
   }
+
+  {
+    _::NetworkFilter filter({"public"}, {}, base);
+
+    // Public
+    KJ_EXPECT(allowed4(filter, "8.8.8.8"));
+  }
 }
 
 KJ_TEST("Network::restrictPeers()") {
@@ -1207,6 +1280,34 @@ KJ_TEST("Network::restrictPeers()") {
   auto& w = ioContext.waitScope;
   auto& network = ioContext.provider->getNetwork();
   auto restrictedNetwork = network.restrictPeers({"public"});
+  KJ_DBG("helllo");
+  KJ_EXPECT(tryParse(w, *restrictedNetwork, "8.8.8.8") == "8.8.8.8:0");
+#if !_WIN32
+  KJ_EXPECT_THROW_MESSAGE("restrictPeers", tryParse(w, *restrictedNetwork, "unix:/foo"));
+#endif
+KJ_DBG("helllo2");
+  auto addr = restrictedNetwork->parseAddress("127.0.0.1").wait(w);
+  KJ_DBG("asd");
+  auto listener = addr->listen();
+  auto acceptTask = listener->accept()
+      .then([](kj::Own<kj::AsyncIoStream>) {
+    KJ_FAIL_EXPECT("should not have received connection");
+  }).eagerlyEvaluate(nullptr);
+KJ_DBG("asd");
+  KJ_EXPECT_THROW_MESSAGE("restrictPeers", addr->connect().wait(w));
+
+  // We can connect to the listener but the connection will be immediately closed.
+  auto addr2 = network.parseAddress("127.0.0.1", listener->getPort()).wait(w);
+  KJ_DBG("asd");
+  auto conn = addr2->connect().wait(w);
+  KJ_EXPECT(conn->readAllText().wait(w) == "");
+}
+
+KJ_TEST("Network::restrictPeers() local and public") {
+  auto ioContext = setupAsyncIo();
+  auto& w = ioContext.waitScope;
+  auto& network = ioContext.provider->getNetwork();
+  auto restrictedNetwork = network.restrictPeers({"local", "public"});
 
   KJ_EXPECT(tryParse(w, *restrictedNetwork, "8.8.8.8") == "8.8.8.8:0");
 #if !_WIN32
@@ -1217,14 +1318,12 @@ KJ_TEST("Network::restrictPeers()") {
 
   auto listener = addr->listen();
   auto acceptTask = listener->accept()
-      .then([](kj::Own<kj::AsyncIoStream>) {
-    KJ_FAIL_EXPECT("should not have received connection");
+      .then([](kj::Own<kj::AsyncIoStream> stream) {
+    stream->shutdownWrite();
   }).eagerlyEvaluate(nullptr);
 
-  KJ_EXPECT_THROW_MESSAGE("restrictPeers", addr->connect().wait(w));
-
   // We can connect to the listener but the connection will be immediately closed.
-  auto addr2 = network.parseAddress("127.0.0.1", listener->getPort()).wait(w);
+  auto addr2 = restrictedNetwork->parseAddress("127.0.0.1", listener->getPort()).wait(w);
   auto conn = addr2->connect().wait(w);
   KJ_EXPECT(conn->readAllText().wait(w) == "");
 }

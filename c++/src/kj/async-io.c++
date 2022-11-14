@@ -28,6 +28,7 @@
 #include "async-io-internal.h"
 #include "debug.h"
 #include "vector.h"
+#include "map.h"
 #include "io.h"
 #include "one-of.h"
 #include <deque>
@@ -3092,6 +3093,17 @@ void CidrRange::zeroIrrelevantBits() {
 
 // -----------------------------------------------------------------------------
 
+ArrayPtr<const CidrRange> networkCidrs() {
+  static const CidrRange result[] = {
+    CidrRange::inet4({0,0,0,0}, 0),
+    CidrRange::inet6({}, {}, 0)
+  };
+
+  // TODO(cleanup): A bug in GCC 4.8, fixed in 4.9, prevents result from implicitly
+  //   casting to our return type.
+  return kj::arrayPtr(result, kj::size(result));
+}
+
 ArrayPtr<const CidrRange> localCidrs() {
   static const CidrRange result[] = {
     // localhost
@@ -3155,8 +3167,25 @@ ArrayPtr<const CidrRange> exampleAddresses() {
   return kj::arrayPtr(result, kj::size(result));
 }
 
+void addAllIfNotIn(
+    Vector<CidrRange>& addTo, ArrayPtr<const CidrRange> list, Vector<CidrRange>& ifNotIn) {
+  HashSet<CidrRange> ifNotInSet;
+  for (auto cidr: ifNotIn) {
+    if (!ifNotInSet.contains(cidr)) {
+      ifNotInSet.insert(cidr);
+    }
+  }
+
+  for (auto cidr: list) {
+    if (!ifNotInSet.contains(cidr)) {
+      addTo.add(cidr);
+    }
+  }
+}
+
 NetworkFilter::NetworkFilter()
-    : allowUnix(true), allowAbstractUnix(true) {
+    : allowUnix(true), allowAbstractUnix(true), allowLocal(false), allowNetwork(false),
+      allowPrivate(false), allowPublic(false), denyLocal(false), denyPrivate(false) {
   allowCidrs.add(CidrRange::inet4({0,0,0,0}, 0));
   allowCidrs.add(CidrRange::inet6({}, {}, 0));
   denyCidrs.addAll(reservedCidrs());
@@ -3164,22 +3193,21 @@ NetworkFilter::NetworkFilter()
 
 NetworkFilter::NetworkFilter(ArrayPtr<const StringPtr> allow, ArrayPtr<const StringPtr> deny,
                              NetworkFilter& next)
-    : allowUnix(false), allowAbstractUnix(false), next(next) {
+    : allowUnix(false), allowAbstractUnix(false), allowLocal(false), allowNetwork(false),
+      allowPrivate(false), allowPublic(false), denyLocal(false), denyPrivate(false), next(next) {
+
   for (auto rule: allow) {
     if (rule == "local") {
-      allowCidrs.addAll(localCidrs());
+      allowLocal = true;
     } else if (rule == "network") {
-      allowCidrs.add(CidrRange::inet4({0,0,0,0}, 0));
-      allowCidrs.add(CidrRange::inet6({}, {}, 0));
-      denyCidrs.addAll(localCidrs());
+      allowNetwork = true;
+      denyLocal = true;
     } else if (rule == "private") {
-      allowCidrs.addAll(privateCidrs());
-      allowCidrs.addAll(localCidrs());
+      allowPrivate = true;
     } else if (rule == "public") {
-      allowCidrs.add(CidrRange::inet4({0,0,0,0}, 0));
-      allowCidrs.add(CidrRange::inet6({}, {}, 0));
-      denyCidrs.addAll(privateCidrs());
-      denyCidrs.addAll(localCidrs());
+      allowPublic = true;
+      denyLocal = true;
+      denyPrivate = true;
     } else if (rule == "unix") {
       allowUnix = true;
     } else if (rule == "unix-abstract") {
@@ -3189,6 +3217,15 @@ NetworkFilter::NetworkFilter(ArrayPtr<const StringPtr> allow, ArrayPtr<const Str
     }
   }
 
+  // if (allowNetwork) {
+  //   addAllIfNotIn(denyCidrs, localCidrs(), allowCidrs);
+  // }
+  // if (allowPublic) {
+  //   addAllIfNotIn(denyCidrs, privateCidrs(), allowCidrs);
+  //   addAllIfNotIn(denyCidrs, localCidrs(), allowCidrs);
+  // }
+
+  KJ_DBG(deny.size());
   for (auto rule: deny) {
     if (rule == "local") {
       denyCidrs.addAll(localCidrs());
@@ -3207,10 +3244,12 @@ NetworkFilter::NetworkFilter(ArrayPtr<const StringPtr> allow, ArrayPtr<const Str
       denyCidrs.add(CidrRange(rule));
     }
   }
+  KJ_DBG(denyCidrs);
 }
 
 bool NetworkFilter::shouldAllow(const struct sockaddr* addr, uint addrlen) {
   KJ_REQUIRE(addrlen >= sizeof(addr->sa_family));
+  KJ_DBG("Should allow: ", denyCidrs);
 
 #if !_WIN32
   if (addr->sa_family == AF_UNIX) {
@@ -3224,6 +3263,7 @@ bool NetworkFilter::shouldAllow(const struct sockaddr* addr, uint addrlen) {
 #endif
 
   bool allowed = false;
+  bool compoundAllowed = false;
   uint allowSpecificity = 0;
   for (auto& cidr: allowCidrs) {
     if (cidr.matches(addr)) {
@@ -3231,7 +3271,54 @@ bool NetworkFilter::shouldAllow(const struct sockaddr* addr, uint addrlen) {
       allowed = true;
     }
   }
-  if (!allowed) return false;
+
+  if ((allowLocal || allowPrivate)) {
+    for (auto& cidr: localCidrs()) {
+      if (cidr.matches(addr)) {
+        allowSpecificity = kj::max(allowSpecificity, cidr.getSpecificity());
+        compoundAllowed = true;
+      }
+    }
+  }
+
+  if (allowPrivate) {
+    for (auto& cidr: privateCidrs()) {
+      if (cidr.matches(addr)) {
+        allowSpecificity = kj::max(allowSpecificity, cidr.getSpecificity());
+        compoundAllowed = true;
+      }
+    }
+  }
+
+  if (allowNetwork || allowPublic) {
+    for (auto& cidr: networkCidrs()) {
+      if (cidr.matches(addr)) {
+        allowSpecificity = kj::max(allowSpecificity, cidr.getSpecificity());
+        compoundAllowed = true;
+      }
+    }
+  }
+
+  if (!allowed && !compoundAllowed) return false;
+
+  if (!allowed) {
+    if (denyLocal && !allowLocal) {
+      for (auto& cidr: localCidrs()) {
+        if (cidr.matches(addr)) {
+          if (cidr.getSpecificity() >= allowSpecificity) return false;
+        }
+      }
+    }
+
+    if (denyPrivate && !allowPrivate) {
+      for (auto& cidr: privateCidrs()) {
+        if (cidr.matches(addr)) {
+          if (cidr.getSpecificity() >= allowSpecificity) return false;
+        }
+      }
+    }
+  }
+
   for (auto& cidr: denyCidrs) {
     if (cidr.matches(addr)) {
       if (cidr.getSpecificity() >= allowSpecificity) return false;

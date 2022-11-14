@@ -1170,6 +1170,7 @@ public:
   }
 
   bool allowedBy(LowLevelAsyncIoProvider::NetworkFilter& filter) {
+    KJ_DBG("HELLO");
     return filter.shouldAllow(&addr.generic, addrlen);
   }
 

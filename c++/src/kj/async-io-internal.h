@@ -21,6 +21,8 @@
 
 #pragma once
 
+#include "debug.h"
+#include "hash.h"
 #include "string.h"
 #include "vector.h"
 #include "async-io.h"
@@ -57,6 +59,15 @@ public:
   bool matchesFamily(int family) const;
 
   String toString() const;
+  inline uint hashCode() const { return kj::hashCode(toString()); }
+  inline bool operator==(CidrRange right) const {
+    for (int i = 0; i < (sizeof(bits)/sizeof(*bits)); i++) {
+      if (bits[i] != right.bits[i]) {
+        return false;
+      }
+    }
+    return family == right.family && bitCount == right.bitCount;
+  }
 
 private:
   int family;
@@ -82,6 +93,12 @@ private:
   Vector<CidrRange> denyCidrs;
   bool allowUnix;
   bool allowAbstractUnix;
+  bool allowLocal;
+  bool allowNetwork;
+  bool allowPrivate;
+  bool allowPublic;
+  bool denyLocal;
+  bool denyPrivate;
 
   kj::Maybe<NetworkFilter&> next;
 };
