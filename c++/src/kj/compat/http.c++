@@ -5757,7 +5757,8 @@ namespace {
 
 class HttpClientAdapter final: public HttpClient {
 public:
-  HttpClientAdapter(HttpService& service): service(service) {}
+  HttpClientAdapter(HttpService& service, bool avoidDelayedEof = false)
+      : service(service), avoidDelayedEof(avoidDelayedEof) {}
 
   Request request(HttpMethod method, kj::StringPtr url, const HttpHeaders& headers,
                   kj::Maybe<uint64_t> expectedBodySize = nullptr) override {
@@ -5820,7 +5821,7 @@ public:
     auto headersCopy = kj::heap(headers.clone());
 
     auto paf = kj::newPromiseAndFulfiller<ConnectResponse>();
-    auto tunnel = kj::refcounted<ConnectResponseImpl>(kj::mv(paf.fulfiller));
+    auto tunnel = kj::refcounted<ConnectResponseImpl>(kj::mv(paf.fulfiller), avoidDelayedEof);
 
     auto requestPaf = kj::newPromiseAndFulfiller<kj::Promise<void>>();
     tunnel->setPromise(kj::mv(requestPaf.promise));
@@ -5834,6 +5835,7 @@ public:
 
 private:
   HttpService& service;
+  bool avoidDelayedEof;
 
   class DelayedEofInputStream final: public kj::AsyncInputStream {
     // An AsyncInputStream wrapper that, when it reaches EOF, delays the final read until some
@@ -6177,8 +6179,9 @@ private:
 
   class ConnectResponseImpl final: public HttpService::ConnectResponse, public kj::Refcounted {
   public:
-    ConnectResponseImpl(kj::Own<kj::PromiseFulfiller<HttpClient::ConnectResponse>> fulfiller)
-        : fulfiller(kj::mv(fulfiller)) {}
+    ConnectResponseImpl(kj::Own<kj::PromiseFulfiller<HttpClient::ConnectResponse>> fulfiller,
+        bool avoidDelayedEof)
+        : fulfiller(kj::mv(fulfiller)), avoidDelayedEof(avoidDelayedEof) {}
 
     void setPromise(kj::Promise<void> promise) {
       task = promise.eagerlyEvaluate([this](kj::Exception&& exception) {
@@ -6199,16 +6202,25 @@ private:
 
       auto pipe = newTwoWayPipe();
 
-      kj::Own<kj::AsyncIoStream> io =
-          kj::heap<DelayedEofIoStream>(kj::mv(pipe.ends[0]),
-              task.attach(kj::addRef(*this), kj::mv(headersCopy)));
+      if (avoidDelayedEof) {
+        fulfiller->fulfill(kj::HttpClient::ConnectResponse {
+          statusCode,
+          statusText,
+          headersCopy.get(),
+          pipe.ends[0].attach(kj::addRef(*this), kj::mv(headersCopy)),
+        });
+      } else {
+        kj::Own<kj::AsyncIoStream> io =
+            kj::heap<DelayedEofIoStream>(kj::mv(pipe.ends[0]),
+                task.attach(kj::addRef(*this), kj::mv(headersCopy)));
+        fulfiller->fulfill(kj::HttpClient::ConnectResponse {
+          statusCode,
+          statusText,
+          headersCopy.get(),
+          kj::mv(io),
+        });
+      }
 
-      fulfiller->fulfill(HttpClient::ConnectResponse {
-        statusCode,
-        statusText,
-        headersCopy.get(),
-        kj::mv(io),
-      });
       return kj::mv(pipe.ends[1]);
     }
 
@@ -6245,14 +6257,15 @@ private:
   private:
     kj::Own<kj::PromiseFulfiller<HttpClient::ConnectResponse>> fulfiller;
     kj::Promise<void> task = nullptr;
+    bool avoidDelayedEof;
   };
 
 };
 
 }  // namespace
 
-kj::Own<HttpClient> newHttpClient(HttpService& service) {
-  return kj::heap<HttpClientAdapter>(service);
+kj::Own<HttpClient> newHttpClient(HttpService& service, bool avoidDelayedEof) {
+  return kj::heap<HttpClientAdapter>(service, avoidDelayedEof);
 }
 
 // =======================================================================================

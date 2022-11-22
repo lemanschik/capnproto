@@ -918,7 +918,7 @@ kj::Own<HttpClient> newConcurrencyLimitingHttpClient(
 // is called when a new connection is opened or enqueued and when an open connection is closed,
 // passing the number of open and pending connections.
 
-kj::Own<HttpClient> newHttpClient(HttpService& service);
+kj::Own<HttpClient> newHttpClient(HttpService& service, bool avoidDelayedEof = false);
 kj::Own<HttpService> newHttpService(HttpClient& client);
 // Adapts an HttpClient to an HttpService and vice versa.
 

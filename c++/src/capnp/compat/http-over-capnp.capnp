@@ -35,6 +35,9 @@ interface HttpService {
   # the client can make calls to stream up the request body. `requestBody` will be null in the case
   # that request.bodySize.fixed == 0.
 
+  startConnect @1 (host :Text, headers :List(HttpHeader), down :ByteStream)
+               -> (response :HttpConnectResponse, up :ByteStream);
+
   interface ClientRequestContext {
     # Provides callbacks for the server to send the response.
 
@@ -96,6 +99,13 @@ struct HttpResponse {
     unknown @3 :Void;   # e.g. due to transfer-encoding: chunked
     fixed @4 :UInt64;   # e.g. due to content-length
   }
+}
+
+struct HttpConnectResponse {
+  isAccept @0 :Bool;
+  statusCode @1 :UInt16;
+  statusText @2 :Text;
+  headers @3 :List(HttpHeader);
 }
 
 enum HttpMethod {

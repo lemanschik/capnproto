@@ -22,6 +22,7 @@
 #include "http-over-capnp.h"
 #include <kj/debug.h>
 #include <capnp/schema.h>
+#include <capnp/message.h>
 
 namespace capnp {
 
@@ -396,6 +397,40 @@ public:
         .attach(kj::mv(deferredCancel));
   }
 
+  kj::Promise<void> connect(
+      kj::StringPtr host, const kj::HttpHeaders& headers, ConnectResponse& tunnel) override {
+    auto rpcRequest = inner.startConnectRequest();
+    auto downPipe = kj::newOneWayPipe();
+    rpcRequest.setHost(host);
+    rpcRequest.setDown(factory.streamFactory.kjToCapnp(kj::mv(downPipe.out)));
+    auto builder = capnp::Request<
+        capnp::HttpService::StartConnectParams,
+        capnp::HttpService::StartConnectResults>::Builder(rpcRequest);
+    rpcRequest.adoptHeaders(factory.headersToCapnp(headers, Orphanage::getForMessageContaining(builder)));
+    RemotePromise<capnp::HttpService::StartConnectResults> pipeline = rpcRequest.send();
+
+    // TODO: We need to get the status code/text and headers here, then feed them into `accept`.
+    // TODO: Requires https://github.com/capnproto/capnproto/pull/1579
+    // capnp::HttpHeaders::Pipeline remoteHeaders = pipeline.getHeaders();
+
+    kj::Own<kj::AsyncIoStream> io = tunnel.accept(200, "OK", headers);
+    auto promises = kj::heapArrayBuilder<kj::Promise<void>>(2);
+    // We read from `downPipe` (the other side writes into it.)
+    promises.add(downPipe.in->pumpTo(*io).then([&io = *io](uint64_t) {
+      io.shutdownWrite();
+    }).eagerlyEvaluate(nullptr));
+    // We write to `up` (the other side reads from it).
+    auto up = pipeline.getUp();
+    kj::Own<kj::AsyncOutputStream> upStream = factory.streamFactory.capnpToKj(up);
+    promises.add(io->pumpTo(*upStream).then([up = kj::mv(up)](uint64_t) mutable {
+      auto endReq = up.endRequest();
+      return endReq.send().ignoreResult();
+    }).eagerlyEvaluate(nullptr));
+
+    return kj::joinPromises(promises.finish()).attach(kj::mv(io), kj::mv(upStream), kj::mv(downPipe));
+  }
+
+
 private:
   HttpOverCapnpFactory& factory;
   capnp::HttpService::Client inner;
@@ -613,6 +648,54 @@ public:
         factory, thisCap(), metadata, params.getContext(), kj::mv(requestBody), *inner));
 
     return kj::READY_NOW;
+  }
+
+  kj::Promise<void> startConnect(StartConnectContext context) override {
+    auto params = context.getParams();
+    auto host = params.getHost();
+    auto headers = factory.headersToKj(params.getHeaders());
+    auto upPipe = kj::newOneWayPipe();
+
+    PipelineBuilder<StartConnectResults> pb;
+    pb.setUp(factory.streamFactory.kjToCapnp(kj::mv(upPipe.out)));
+
+    context.setPipeline(pb.build());
+
+    auto client = kj::newHttpClient(*inner, true);
+    return client->connect(host, headers).then(
+        [this, upPipe = kj::mv(upPipe), down = params.getDown(), context = kj::mv(context)](
+        kj::HttpClient::ConnectResponse response) mutable {
+      auto headers = response.headers->clone();
+      kj::Own<kj::AsyncOutputStream> stream = factory.streamFactory.capnpToKj(down);
+      auto results = context.getResults().initResponse();
+      KJ_SWITCH_ONEOF(response.connectionOrBody) {
+        KJ_CASE_ONEOF(io, kj::Own<kj::AsyncIoStream>) {
+          results.setIsAccept(true);
+          MallocMessageBuilder message;
+          capnp::Orphan<capnp::List<capnp::HttpHeader>> newHeaders =
+              factory.headersToCapnp(headers, message.getOrphanage());
+          results.setHeaders(newHeaders.getReader());
+
+          auto promises = kj::heapArrayBuilder<kj::Promise<void>>(2);
+          // We write to the `down` pipe.
+          promises.add(io->pumpTo(*stream).then([down = kj::mv(down)](uint64_t) mutable {
+            auto endReq = down.endRequest();
+            return endReq.send().ignoreResult();
+          }).eagerlyEvaluate(nullptr));
+          // We read from the `up` pipe.
+          promises.add(upPipe.in->pumpTo(*io).then([&io = *io](uint64_t size) {
+            io.shutdownWrite();
+          }).eagerlyEvaluate(nullptr));
+
+          return kj::joinPromises(promises.finish()).attach(kj::mv(io), kj::mv(upPipe), kj::mv(down), kj::mv(stream));
+        }
+        KJ_CASE_ONEOF(input, kj::Own<kj::AsyncInputStream>) {
+          results.setIsAccept(false);
+          return input->pumpTo(*stream).ignoreResult().attach(kj::mv(input));
+        }
+      }
+      KJ_UNREACHABLE;
+    }).attach(kj::mv(host), kj::mv(headers));
   }
 
 private:
